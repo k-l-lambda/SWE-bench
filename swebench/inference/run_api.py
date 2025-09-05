@@ -24,6 +24,7 @@ from datasets import load_dataset, load_from_disk
 from swebench.inference.make_datasets.utils import extract_diff
 from argparse import ArgumentParser
 import logging
+from transformers import AutoTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ MODEL_LIMITS = {
     "gpt-4-0613": 8_192,
     "gpt-4-1106-preview": 128_000,
     "gpt-4-0125-preview": 128_000,
+    "NVFP4/Qwen3-Coder-480B-A35B-Instruct-FP4": 256_000,
 }
 
 # The cost per token for each model input.
@@ -61,6 +63,7 @@ MODEL_COST_PER_INPUT = {
     "gpt-4-32k": 0.00006,
     "gpt-4-1106-preview": 0.00001,
     "gpt-4-0125-preview": 0.00001,
+    "NVFP4/Qwen3-Coder-480B-A35B-Instruct-FP4": 0.00001,
 }
 
 # The cost per token for each model output.
@@ -80,6 +83,7 @@ MODEL_COST_PER_OUTPUT = {
     "gpt-4-32k": 0.00012,
     "gpt-4-1106-preview": 0.00003,
     "gpt-4-0125-preview": 0.00003,
+    "NVFP4/Qwen3-Coder-480B-A35B-Instruct-FP4": 0.00003,
 }
 
 # used for azure
@@ -111,7 +115,7 @@ def calc_cost(model_name, input_tokens, output_tokens):
 
 
 @retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
-def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model_args):
+def call_chat(client, model_name_or_path, inputs, use_azure, temperature, top_p, **model_args):
     """
     Calls the openai API to generate completions for the given inputs.
 
@@ -127,7 +131,7 @@ def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model
     user_message = inputs.split("\n", 1)[1]
     try:
         if use_azure:
-            response = openai.chat.completions.create(
+            response = client.chat.completions.create(
                 engine=ENGINES[model_name_or_path] if use_azure else None,
                 messages=[
                     {"role": "system", "content": system_messages},
@@ -138,7 +142,7 @@ def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model
                 **model_args,
             )
         else:
-            response = openai.chat.completions.create(
+            response = client.chat.completions.create(
                 model=model_name_or_path,
                 messages=[
                     {"role": "system", "content": system_messages},
@@ -190,24 +194,32 @@ def openai_inference(
     existing_ids (set): A set of ids that have already been processed.
     max_cost (float): The maximum cost to spend on inference.
     """
-    encoding = tiktoken.encoding_for_model(model_name_or_path)
+    #encoding = tiktoken.encoding_for_model(model_name_or_path)
+    encoding = AutoTokenizer.from_pretrained(model_name_or_path)
     test_dataset = test_dataset.filter(
         lambda x: gpt_tokenize(x["text"], encoding) <= MODEL_LIMITS[model_name_or_path],
         desc="Filtering",
         load_from_cache_file=False,
     )
+    # Select the last 100 examples of test_dataset
+    if len(test_dataset) > 100:
+        test_dataset = test_dataset.select(range(len(test_dataset) - 100, len(test_dataset)))
     openai_key = os.environ.get("OPENAI_API_KEY", None)
     if openai_key is None:
         raise ValueError(
             "Must provide an api key. Expected in OPENAI_API_KEY environment variable."
         )
-    openai.api_key = openai_key
+    openai.api_key = ''#openai_key
     print(f"Using OpenAI key {'*' * max(0, len(openai_key) - 5) + openai_key[-5:]}")
     use_azure = model_args.pop("use_azure", False)
     if use_azure:
         openai.api_type = "azure"
         openai.api_base = "https://pnlpopenai3.openai.azure.com/"
         openai.api_version = "2023-05-15"
+    client = openai.OpenAI(
+        base_url="http://localhost:8000/v1/",
+        api_key=openai.api_key,
+    )
     temperature = model_args.pop("temperature", 0.2)
     top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
     print(f"Using temperature={temperature}, top_p={top_p}")
@@ -225,6 +237,7 @@ def openai_inference(
             output_dict.update(basic_args)
             output_dict["text"] = f"{datum['text']}\n\n"
             response, cost = call_chat(
+                client,
                 output_dict["model_name_or_path"],
                 output_dict["text"],
                 use_azure,
@@ -504,7 +517,7 @@ def main(
     elif model_name_or_path.startswith("gpt"):
         openai_inference(**inference_args)
     else:
-        raise ValueError(f"Invalid model name or path {model_name_or_path}")
+        openai_inference(**inference_args)
     logger.info("Done!")
 
 
